@@ -1,0 +1,32 @@
+[package]
+name = "css-asset-pack"
+version = "0.1.0"
+description = """
+Allows a zip file containing a top-level CSS file and assets (e.g.,
+image files, fonts) to be transformed into Object URLs that can then
+be used to update a Web Document.
+"""
+edition = "2024"
+keywords = ["css", "web", "gamedev", "2d", "tauri"]
+categories = ["web-programming", "game-development"]
+repository = "https://github.com/ctm/css-asset-pack"
+license = "Unlicense OR MIT"
+publish = false
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+regex = "1.12"
+
+[dependencies]
+web-sys = { version = "0.3.83", default-features = false, features = ["Blob", "Url"] }
+js-sys = "0.3"
+# Can't use zstd with wasm32-unknown-unknown
+zip = { version = "8.4", default-features = false, features = ["bzip2", "deflate", "deflate64", "lzma", "ppmd", "xz"] }
+lightningcss = { version = "1.0.0-alpha.71", default-features = false, features = ["visitor"] }
+thiserror = "2.0"
+grass = { version = "0.13.4", default-features = false, optional = true }
+
+# NOTE: if we use the "0.4" here, our tests will fail to compile, because
+#       lightningcss v1.0.0-alpha.71 brings in ahash  v0.8.12 brings in
+#       getrandome 0.3 and we won't then have the wasm_js feature.
+getrandom = { version = "0.3", features = ["wasm_js"]}
