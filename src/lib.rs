@@ -191,7 +191,11 @@ impl<'i, R: Read + Seek> Visitor<'i> for Builder<R> {
     }
 
     fn visit_url(&mut self, url: &mut Url<'i>) -> Result<(), Self::Error> {
-        url.url = self.object_url(&url.url)?.into();
+        match self.object_url(&url.url) {
+            Ok(u) => url.url = u.into(),
+            Err(Error::CantFind(_)) => {}
+            Err(e) => return Err(e),
+        }
         Ok(())
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "css-asset-pack"
-version = "0.1.0"
+version = "0.1.1"
 description = """
 Allows a zip file containing a top-level CSS file and assets (e.g.,
 image files, fonts) to be transformed into Object URLs that can then
