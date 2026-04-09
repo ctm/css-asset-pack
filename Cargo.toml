@@ -1,6 +1,6 @@
 [package]
 name = "css-asset-pack"
-version = "0.1.1"
+version = "0.1.2"
 description = """
 Allows a zip file containing a top-level CSS file and assets (e.g.,
 image files, fonts) to be transformed into Object URLs that can then
@@ -18,13 +18,14 @@ wasm-bindgen-test = "0.3"
 regex = "1.12"
 
 [dependencies]
-web-sys = { version = "0.3.83", default-features = false, features = ["Blob", "Url"] }
+web-sys = { version = "0.3.83", default-features = false, features = ["Blob", "BlobPropertyBag", "Url"] }
 js-sys = "0.3"
 # Can't use zstd with wasm32-unknown-unknown
 zip = { version = "8.4", default-features = false, features = ["bzip2", "deflate", "deflate64", "lzma", "ppmd", "xz"] }
 lightningcss = { version = "1.0.0-alpha.71", default-features = false, features = ["visitor"] }
 thiserror = "2.0"
 grass = { version = "0.13.4", default-features = false, optional = true }
+mime_guess = { version = "2.0", default-features = false, optional = true }
 
 # NOTE: if we use the "0.4" here, our tests will fail to compile, because
 #       lightningcss v1.0.0-alpha.71 brings in ahash  v0.8.12 brings in

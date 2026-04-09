@@ -14,7 +14,7 @@ use {
         string::FromUtf8Error,
     },
     thiserror::Error as ThisError,
-    web_sys::{Blob, Url as WebSysUrl, wasm_bindgen::JsValue},
+    web_sys::{Blob, BlobPropertyBag, Url as WebSysUrl, wasm_bindgen::JsValue},
     zip::{ZipArchive, result::ZipError},
 };
 
@@ -86,14 +86,33 @@ struct Builder<R> {
     visit_pass: Option<VisitPass>,
 }
 
-fn object_url_for(data: &[u8]) -> Result<String, Error> {
+fn object_url_for(data: &[u8], mime_type: Option<&str>) -> Result<String, Error> {
     let uint8_array = Uint8Array::new_with_length(data.len() as u32);
     uint8_array.copy_from(data);
     let parts = Array::new();
     parts.push(&uint8_array);
-    let blob = Blob::new_with_u8_array_sequence(&parts).map_err(Error::BlobConstruction)?;
+    let properties = BlobPropertyBag::new();
+    if let Some(t) = mime_type {
+        properties.set_type(t);
+    }
+    let blob = Blob::new_with_u8_array_sequence_and_options(&parts, &properties)
+        .map_err(Error::BlobConstruction)?;
     let url = web_sys::Url::create_object_url_with_blob(&blob).map_err(Error::ObjectUrlCreation)?;
     Ok(url)
+}
+
+fn type_for(url: &str) -> Option<&'static str> {
+    #[cfg(feature = "mime_guess")]
+    {
+        mime_guess::from_path(url).first_raw()
+    }
+
+    #[cfg(not(feature = "mime_guess"))]
+    if url.ends_with(".svg") {
+        Some("image/svg+xml")
+    } else {
+        None
+    }
 }
 
 impl<R: Read + Seek> Builder<R> {
@@ -173,7 +192,7 @@ impl<R: Read + Seek> Builder<R> {
             };
         }
         self.object_urls.insert(url.to_string(), Computing);
-        let object_url = object_url_for(&self.data(url)?)?;
+        let object_url = object_url_for(&self.data(url)?, type_for(url))?;
         *(self.object_urls.get_mut(url).unwrap()) = Computed(object_url.clone());
         Ok(object_url)
     }
