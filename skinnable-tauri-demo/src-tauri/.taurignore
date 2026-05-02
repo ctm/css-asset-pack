@@ -1,0 +1,6 @@
+# Ignore Emacs lock files (e.g., .#main.rs)
+.#*
+# Ignore auto-save files (e.g., #main.rs#)
+#*#
+# Ignore backup files (e.g., main.rs~)
+*~
