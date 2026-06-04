@@ -1,2 +1,7 @@
 /target
 .DS_Store
+
+# beads_rust (managed by rust-bucket)
+.beads/.br_history/
+.beads/beads.db
+.beads/beads.db-wal
