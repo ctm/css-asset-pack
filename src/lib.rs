@@ -1,5 +1,11 @@
+#[cfg(not(target_arch = "wasm32"))]
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+#[cfg(target_arch = "wasm32")]
 use {
     js_sys::{Array, Uint8Array},
+    web_sys::{Blob, BlobPropertyBag, Url as WebSysUrl, wasm_bindgen::JsValue},
+};
+use {
     lightningcss::{
         error::{Error as LightningCssError, PrinterErrorKind},
         rules::CssRule,
@@ -14,7 +20,6 @@ use {
         string::FromUtf8Error,
     },
     thiserror::Error as ThisError,
-    web_sys::{Blob, BlobPropertyBag, Url as WebSysUrl, wasm_bindgen::JsValue},
     zip::{ZipArchive, result::ZipError},
 };
 
@@ -50,9 +55,11 @@ pub enum Error {
     #[error("can't convert to utf-8: #{0}")]
     NotUtf8(FromUtf8Error),
 
+    #[cfg(target_arch = "wasm32")]
     #[error("can't create blob: #{0:?}")]
     BlobConstruction(JsValue),
 
+    #[cfg(target_arch = "wasm32")]
     #[error("can't create object_url: #{0:?}")]
     ObjectUrlCreation(JsValue),
 
@@ -71,6 +78,7 @@ enum ObjUrlHolder {
     Computed(String),
 }
 
+#[cfg(target_arch = "wasm32")]
 impl From<ObjUrlHolder> for Option<String> {
     fn from(v: ObjUrlHolder) -> Option<String> {
         match v {
@@ -86,6 +94,10 @@ struct Builder<R> {
     visit_pass: Option<VisitPass>,
 }
 
+// On the web the asset bytes become a revocable blob Object URL. Off the web
+// (e.g. the native render harness) there is no `URL` object, so the bytes are
+// embedded directly as a base64-encoded `data:` URI instead.
+#[cfg(target_arch = "wasm32")]
 fn object_url_for(data: &[u8], mime_type: Option<&str>) -> Result<String, Error> {
     let uint8_array = Uint8Array::new_with_length(data.len() as u32);
     uint8_array.copy_from(data);
@@ -99,6 +111,12 @@ fn object_url_for(data: &[u8], mime_type: Option<&str>) -> Result<String, Error>
         .map_err(Error::BlobConstruction)?;
     let url = web_sys::Url::create_object_url_with_blob(&blob).map_err(Error::ObjectUrlCreation)?;
     Ok(url)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn object_url_for(data: &[u8], mime_type: Option<&str>) -> Result<String, Error> {
+    let mime = mime_type.unwrap_or("");
+    Ok(format!("data:{mime};base64,{}", STANDARD.encode(data)))
 }
 
 fn type_for(url: &str) -> Option<&'static str> {
@@ -175,6 +193,7 @@ impl<R: Read + Seek> Builder<R> {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
     fn into_object_urls(self) -> Vec<String> {
         self.object_urls
             .into_values()
@@ -263,6 +282,9 @@ fn top_level<R: Read + Seek>(
 
 pub struct AssetPack {
     data: String,
+    // Blob Object URLs must be revoked on drop; the native `data:` URIs are
+    // self-contained and need no cleanup, so this field only exists on the web.
+    #[cfg(target_arch = "wasm32")]
     object_urls: Vec<String>,
 }
 
@@ -271,8 +293,10 @@ impl AssetPack {
         use Error::*;
 
         let mut builder = Builder::new(ZipArchive::new(reader).map_err(CantReadZipFile)?);
+        let data = builder.data(top_level)?.try_into().map_err(NotUtf8)?;
         Ok(Self {
-            data: builder.data(top_level)?.try_into().map_err(NotUtf8)?,
+            data,
+            #[cfg(target_arch = "wasm32")]
             object_urls: builder.into_object_urls(),
         })
     }
@@ -282,6 +306,7 @@ impl AssetPack {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 impl Drop for AssetPack {
     fn drop(&mut self) {
         for url in &self.object_urls {
@@ -324,5 +349,29 @@ mod tests {
         let zip = Cursor::new(include_bytes!("../test-data/alternate.zip"));
         let pack = AssetPack::new(zip, "alternate.css").unwrap();
         assert!(REGEX.is_match(pack.data()));
+    }
+
+    // Native (non-browser) build: assets are embedded as base64 `data:` URIs
+    // rather than blob Object URLs, so the compiled top level rewrites its
+    // `@import` (and the nested `url()`) to self-contained data URIs.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn embeds_assets_as_data_uris() -> Result<(), Box<dyn std::error::Error>> {
+        let zip = Cursor::new(include_bytes!("../test-data/alternate.zip"));
+        let pack = AssetPack::new(zip, "alternate.css")?;
+        let data = pack.data();
+        assert!(
+            data.starts_with("@import \"data:"),
+            "expected @import rewritten to a data: URI, got: {data}"
+        );
+        assert!(
+            data.contains(";base64,"),
+            "expected a base64-encoded data: URI, got: {data}"
+        );
+        assert!(
+            !data.contains("blob:"),
+            "native path must not emit blob: Object URLs, got: {data}"
+        );
+        Ok(())
     }
 }
