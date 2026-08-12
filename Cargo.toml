@@ -40,4 +40,4 @@ getrandom = { version = "0.3", features = ["wasm_js"]}
 # Off the web there is no `URL` object, so assets are embedded as base64
 # `data:` URIs instead.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-base64 = "0.22"
+base64 = "0.23"
