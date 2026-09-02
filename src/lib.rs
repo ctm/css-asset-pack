@@ -63,13 +63,13 @@ pub enum Error {
     #[error("can't create object_url: #{0:?}")]
     ObjectUrlCreation(JsValue),
 
-    #[cfg(not(feature = "grass"))]
-    #[error("needs grass feature enabled: #{0}")]
-    NeedsGrass(String),
+    #[cfg(not(feature = "sasso"))]
+    #[error("needs sasso feature enabled: #{0}")]
+    NeedsSasso(String),
 
-    #[cfg(feature = "grass")]
+    #[cfg(feature = "sasso")]
     #[error("can't parse sass: #{0:?}")]
-    CantParseSass(Box<grass::Error>),
+    CantParseSass(sasso::Error),
 }
 
 #[derive(Clone)]
@@ -147,9 +147,9 @@ impl<R: Read + Seek> Builder<R> {
 
         let mut file = self.archive.by_name(filename).map_err(CantFind)?;
         let is_sass = filename.ends_with(".scss") || filename.ends_with(".sass");
-        #[cfg(not(feature = "grass"))]
+        #[cfg(not(feature = "sasso"))]
         if is_sass {
-            return Err(NeedsGrass(filename.to_string()));
+            return Err(NeedsSasso(filename.to_string()));
         }
         let needs_css_processing = is_sass || filename.ends_with(".css");
 
@@ -158,9 +158,9 @@ impl<R: Read + Seek> Builder<R> {
                 let mut css_source = String::new();
                 file.read_to_string(&mut css_source).map_err(CantRead)?;
                 drop(file); // Shouldn't be needed, IMO
-                #[cfg(feature = "grass")]
+                #[cfg(feature = "sasso")]
                 if is_sass {
-                    css_source = grass::from_string(css_source, &grass::Options::default())
+                    css_source = sasso::compile(&css_source, &sasso::Options::default())
                         .map_err(Error::CantParseSass)?;
                 }
                 css_source

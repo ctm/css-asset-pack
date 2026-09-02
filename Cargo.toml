@@ -22,7 +22,7 @@ regex = "1.12"
 zip = { version = "8.4", default-features = false, features = ["bzip2", "deflate", "deflate64", "lzma", "ppmd", "xz"] }
 lightningcss = { version = "1.0.0-alpha.71", default-features = false, features = ["visitor"] }
 thiserror = "2.0"
-grass = { version = "0.13.4", default-features = false, optional = true }
+sasso = { version = "0.9.1", optional = true }
 mime_guess = { version = "2.0", default-features = false, optional = true }
 
 # The web build turns assets into blob Object URLs via the browser's `URL`.
