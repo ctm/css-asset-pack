@@ -351,6 +351,31 @@ mod tests {
         assert!(REGEX.is_match(pack.data()));
     }
 
+    // The `.scss` entry path only exists with the `sasso` feature: the compiled
+    // top level must have its SASS variable resolved and its nesting flattened.
+    // A broken SCSS compile would leave `$brand` unresolved (or error outright),
+    // so these assertions fail if `sasso::compile` stops being invoked.
+    #[cfg(all(feature = "sasso", not(target_arch = "wasm32")))]
+    #[test]
+    fn compiles_scss_entry() -> Result<(), Box<dyn std::error::Error>> {
+        let zip = Cursor::new(include_bytes!("../test-data/sass.zip"));
+        let pack = AssetPack::new(zip, "sass.scss")?;
+        let data = pack.data();
+        assert!(
+            data.contains("#123456"),
+            "expected the SASS variable resolved to its value, got: {data}"
+        );
+        assert!(
+            !data.contains("$brand"),
+            "expected no unresolved SASS variable, got: {data}"
+        );
+        assert!(
+            data.contains("body a"),
+            "expected SASS nesting flattened to a descendant selector, got: {data}"
+        );
+        Ok(())
+    }
+
     // Native (non-browser) build: assets are embedded as base64 `data:` URIs
     // rather than blob Object URLs, so the compiled top level rewrites its
     // `@import` (and the nested `url()`) to self-contained data URIs.
