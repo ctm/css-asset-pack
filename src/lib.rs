@@ -145,9 +145,32 @@ pub const KNOWN_UNLISTED_PROPERTIES: &[&str] = &[
     "font-variant-numeric",
     "overflow-anchor",
     "pointer-events",
+    "position-anchor",
+    "position-area",
     "scrollbar-width",
     "will-change",
 ];
+
+/// The `@counter-style` descriptors, which this lightningcss keeps in a plain
+/// declaration block because it has no parser for any of them. An unknown name
+/// in that block is measured against these instead of the property list. Keep
+/// this sorted.
+const COUNTER_STYLE_DESCRIPTORS: [&str; 10] = [
+    "additive-symbols",
+    "fallback",
+    "negative",
+    "pad",
+    "prefix",
+    "range",
+    "speak-as",
+    "suffix",
+    "symbols",
+    "system",
+];
+
+/// The `@page` descriptors, which its block holds alongside real properties.
+/// Keep this sorted.
+const PAGE_DESCRIPTORS: [&str; 4] = ["bleed", "marks", "page-orientation", "size"];
 
 /// The CSS-wide keywords. Every typed property parser but `all`'s rejects
 /// them, leaving a perfectly valid declaration unparsed.
@@ -221,23 +244,50 @@ fn rule_location(rule: &CssRule) -> Option<Location> {
         CssRule::NestedDeclarations(rule) => Some(rule.loc),
         CssRule::Viewport(rule) => Some(rule.loc),
         CssRule::CustomMedia(rule) => Some(rule.loc),
+        CssRule::LayerStatement(rule) => Some(rule.loc),
         CssRule::LayerBlock(rule) => Some(rule.loc),
         CssRule::Property(rule) => Some(rule.loc),
         CssRule::Container(rule) => Some(rule.loc),
         CssRule::Scope(rule) => Some(rule.loc),
         CssRule::StartingStyle(rule) => Some(rule.loc),
         CssRule::ViewTransition(rule) => Some(rule.loc),
+        CssRule::PositionTry(rule) => Some(rule.loc),
         CssRule::Unknown(rule) => Some(rule.loc),
         _ => None,
     }
 }
 
+/// What the declarations of the rule being visited are. `@counter-style`,
+/// `@page` and `@viewport` store descriptors in the same declaration block a
+/// style rule stores properties in, so the check has to tell them apart.
+#[derive(Clone, Copy)]
+enum DeclarationContext {
+    /// Ordinary properties, `@position-try`'s declarations included.
+    Properties,
+    CounterStyle,
+    Page,
+    /// A deprecated `@viewport`, whose block is not checked at all.
+    Viewport,
+}
+
+impl DeclarationContext {
+    fn of(rule: &CssRule) -> Self {
+        match rule {
+            CssRule::CounterStyle(_) => Self::CounterStyle,
+            CssRule::Page(_) => Self::Page,
+            CssRule::Viewport(_) => Self::Viewport,
+            _ => Self::Properties,
+        }
+    }
+}
+
 /// Fails on the first declaration [`check_css`] considers a typo. A
 /// declaration carries no location of its own, so rules are visited to track
-/// the enclosing one's.
+/// the enclosing one's location and the kind of declarations it holds.
 struct DeclarationCheck<'a> {
     filename: &'a str,
     loc: Option<Location>,
+    context: DeclarationContext,
 }
 
 impl DeclarationCheck<'_> {
@@ -271,16 +321,27 @@ impl DeclarationCheck<'_> {
                 let CustomPropertyName::Unknown(ident) = &custom.name else {
                     return Ok(());
                 };
-                let name: &str = ident.as_ref();
-                if KNOWN_UNLISTED_PROPERTIES.contains(&name) {
-                    return Ok(());
-                }
-                Err(self.error(format!(
-                    "unknown property `{name}` (a real property lightningcss \
-                     does not know? add it to KNOWN_UNLISTED_PROPERTIES)"
-                )))
+                self.check_unknown_name(ident.as_ref())
             }
             _ => Ok(()),
+        }
+    }
+
+    /// Whether `name`, which no property parser claimed, is valid where it
+    /// appears: a descriptor of the enclosing rule, or a real property
+    /// lightningcss does not know.
+    fn check_unknown_name(&self, name: &str) -> Result<(), CssSyntaxError> {
+        match self.context {
+            DeclarationContext::CounterStyle if COUNTER_STYLE_DESCRIPTORS.contains(&name) => Ok(()),
+            DeclarationContext::CounterStyle => {
+                Err(self.error(format!("unknown @counter-style descriptor `{name}`")))
+            }
+            DeclarationContext::Page if PAGE_DESCRIPTORS.contains(&name) => Ok(()),
+            _ if KNOWN_UNLISTED_PROPERTIES.contains(&name) => Ok(()),
+            _ => Err(self.error(format!(
+                "unknown property `{name}` (a real property lightningcss \
+                 does not know? add it to KNOWN_UNLISTED_PROPERTIES)"
+            ))),
         }
     }
 }
@@ -296,13 +357,19 @@ impl<'i> Visitor<'i> for DeclarationCheck<'_> {
         if let Some(loc) = rule_location(rule) {
             self.loc = Some(loc);
         }
-        rule.visit_children(self)
+        let enclosing = std::mem::replace(&mut self.context, DeclarationContext::of(rule));
+        let result = rule.visit_children(self);
+        self.context = enclosing;
+        result
     }
 
     fn visit_declaration_block(
         &mut self,
         block: &mut DeclarationBlock<'i>,
     ) -> Result<(), Self::Error> {
+        if matches!(self.context, DeclarationContext::Viewport) {
+            return Ok(());
+        }
         for property in block
             .declarations
             .iter()
@@ -328,6 +395,12 @@ impl<'i> Visitor<'i> for DeclarationCheck<'_> {
 /// `text-shadow`/`box-shadow` are valid CSS lightningcss nonetheless leaves
 /// unparsed, so they are exempt; the real properties it does not know are
 /// listed in [`KNOWN_UNLISTED_PROPERTIES`].
+///
+/// The blocks of `@counter-style`, `@page` and `@viewport` hold descriptors
+/// rather than properties, and lightningcss parses none of them, so an unknown
+/// name there is measured against the enclosing rule's own descriptors instead
+/// — a `@page` block holds real properties too, and a deprecated `@viewport`
+/// block is not checked at all.
 pub fn check_css(css: &str, filename: &str) -> Result<(), CssSyntaxError> {
     let warnings: Warnings = Default::default();
 
@@ -341,6 +414,7 @@ pub fn check_css(css: &str, filename: &str) -> Result<(), CssSyntaxError> {
     parsed_css.visit(&mut DeclarationCheck {
         filename,
         loc: None,
+        context: DeclarationContext::Properties,
     })
 }
 
@@ -789,6 +863,73 @@ mod tests {
         .unwrap_err();
         assert_eq!(2, nested.line);
         assert_eq!("table.css", nested.filename);
+        Ok(())
+    }
+
+    // `@counter-style`, `@page` and `@viewport` hold descriptors rather than
+    // properties, so a name in one of those blocks is measured against that
+    // rule's own descriptors — whatever its value, since lightningcss parses
+    // none of them. A `@page` block holds real properties too, `@viewport` is
+    // deprecated and skipped, and `@position-try` holds nothing but ordinary
+    // properties. The context is the innermost rule's, so a block following a
+    // descriptor rule is checked as properties again.
+    #[test]
+    fn checks_descriptor_blocks_against_their_rules() -> Result<(), Box<dyn std::error::Error>> {
+        for (css, expected) in [
+            (
+                "@counter-style c { system: cyclic; symbols: a; suffix: \". \" }",
+                None,
+            ),
+            (
+                "@counter-style c { systm: cyclic }",
+                Some("unknown @counter-style descriptor `systm`".to_string()),
+            ),
+            ("@page { margin: 1in; size: a4 }", None),
+            (
+                "@page { margn: 1in }",
+                Some(UNKNOWN_COLR.replace("colr", "margn")),
+            ),
+            ("@position-try --p { top: 0; position-area: top }", None),
+            (
+                "@position-try --p { widthh: 0 }",
+                Some(UNKNOWN_COLR.replace("colr", "widthh")),
+            ),
+            ("@viewport { width: device-width }", None),
+            (
+                "@media print { @counter-style c { system: cyclic } a { colr: red } }",
+                Some(UNKNOWN_COLR.to_string()),
+            ),
+        ] {
+            match (check_css(css, "table.css"), expected) {
+                (Ok(()), None) => {}
+                (Err(error), Some(message)) if error.message == message => {}
+                (got, expected) => {
+                    return Err(format!("{css}: expected {expected:?}, got {got:?}").into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // A `@page` margin box is a rule lightningcss does not expose as a
+    // `CssRule`, so its typo is reported at the `@page` enclosing it, while
+    // `@layer` and `@position-try` carry a location like any other rule.
+    #[test]
+    fn descriptor_rules_are_located() -> Result<(), Box<dyn std::error::Error>> {
+        let margin_box = check_css(
+            "a { color: red }\n@page {\n  margin: 1in;\n  @top-center { contnt: \"x\" }\n}\n",
+            "table.css",
+        )
+        .unwrap_err();
+        assert_eq!(2, margin_box.line);
+        assert_eq!(UNKNOWN_COLR.replace("colr", "contnt"), margin_box.message);
+
+        let position_try = check_css("@position-try --p { widthh: 0 }", "table.css").unwrap_err();
+        assert_eq!(1, position_try.line);
+        assert_eq!(1, position_try.column);
+
+        let layered = check_css("@layer a, b;\nb { width: 10pxx }", "table.css").unwrap_err();
+        assert_eq!(2, layered.line);
         Ok(())
     }
 
