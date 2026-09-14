@@ -18,6 +18,7 @@ use {
         collections::HashMap,
         io::{self, Read, Seek},
         string::FromUtf8Error,
+        sync::{Arc, RwLock},
     },
     thiserror::Error as ThisError,
     zip::{ZipArchive, result::ZipError},
@@ -86,45 +87,61 @@ pub struct CssSyntaxError {
     pub message: String,
 }
 
+/// Collects the errors the parser recovers from rather than failing on.
+type Warnings<'i> = Arc<RwLock<Vec<LightningCssError<ParserError<'i>>>>>;
+
 fn parse_stylesheet<'i>(
     css: &'i str,
     filename: &str,
+    warnings: Option<Warnings<'i>>,
 ) -> Result<StyleSheet<'i>, LightningCssError<ParserError<'i>>> {
     StyleSheet::parse(
         css,
         ParserOptions {
             filename: filename.to_string(),
+            warnings,
             ..Default::default()
         },
     )
 }
 
-/// Reports the first syntax error in `css`, if any, using the parser and the
-/// parser options that asset packs are built with. `filename` only names the
-/// CSS in the returned error.
-///
-/// The parser recovers from a declaration it can't parse by dropping it, so it
-/// reports only an error that stops the parse, e.g. a bad selector or at-rule
-/// prelude.
-pub fn check_css(css: &str, filename: &str) -> Result<(), CssSyntaxError> {
-    parse_stylesheet(css, filename).map(|_| ()).map_err(|e| {
-        let message = e.kind.to_string();
+fn syntax_error(error: LightningCssError<ParserError>, filename: &str) -> CssSyntaxError {
+    let message = error.kind.to_string();
 
-        match e.loc {
-            Some(loc) => CssSyntaxError {
-                filename: loc.filename,
-                line: loc.line + 1,
-                column: loc.column,
-                message,
-            },
-            None => CssSyntaxError {
-                filename: filename.to_string(),
-                line: 0,
-                column: 0,
-                message,
-            },
-        }
-    })
+    match error.loc {
+        Some(loc) => CssSyntaxError {
+            filename: loc.filename,
+            line: loc.line + 1,
+            column: loc.column,
+            message,
+        },
+        None => CssSyntaxError {
+            filename: filename.to_string(),
+            line: 0,
+            column: 0,
+            message,
+        },
+    }
+}
+
+/// Reports the first syntax error in `css`, if any, using the parser asset
+/// packs are built with. `filename` only names the CSS in the returned error.
+///
+/// Unlike a pack build, the check also reports the errors the parser recovers
+/// from rather than fails on, e.g. an unknown at-rule. It cannot report a
+/// mistyped property name or value (`a { colr: red }`, `a { width: 10pxx }`,
+/// `a { color: }`): lightningcss keeps a declaration it can't parse verbatim,
+/// as an unparsed property, so no error is raised for it to collect.
+pub fn check_css(css: &str, filename: &str) -> Result<(), CssSyntaxError> {
+    let warnings: Warnings = Default::default();
+
+    parse_stylesheet(css, filename, Some(warnings.clone()))
+        .map_err(|e| syntax_error(e, filename))?;
+
+    match warnings.read().ok().and_then(|w| w.first().cloned()) {
+        Some(warning) => Err(syntax_error(warning, filename)),
+        None => Ok(()),
+    }
 }
 
 #[derive(Clone)]
@@ -220,8 +237,8 @@ impl<R: Read + Seek> Builder<R> {
                 }
                 css_source
             };
-            let mut parsed_css =
-                parse_stylesheet(&css_source, filename).map_err(|e| CantParse(e.to_string()))?;
+            let mut parsed_css = parse_stylesheet(&css_source, filename, None)
+                .map_err(|e| CantParse(e.to_string()))?;
 
             let incoming_visit_pass = self.visit_pass;
 
@@ -447,6 +464,7 @@ mod tests {
             "a:: { color: red }",
             "@import url(x.css) foo bar;",
             "a[ { color: red }",
+            "a { color: red !impotant }",
         ] {
             let error = check_css(css, "table.css").unwrap_err();
 
@@ -469,12 +487,30 @@ mod tests {
         assert_eq!(18, error.column);
     }
 
-    // The parser recovers from an unparsable declaration (it drops it) and
-    // closes an unterminated block at end of input, so neither is reported.
+    // An unknown at-rule does not stop the parse; the check collects it anyway.
     #[test]
-    fn accepts_what_the_parser_recovers_from() -> Result<(), Box<dyn std::error::Error>> {
-        check_css("a { color: }", "table.css")?;
-        check_css("a { color: red", "table.css")?;
+    fn reports_errors_the_parser_recovers_from() {
+        let error = check_css("a { color: red }\n@tailwind base;\n", "table.css").unwrap_err();
+
+        assert_eq!("table.css", error.filename);
+        assert_eq!(2, error.line);
+        assert!(!error.message.is_empty());
+    }
+
+    // lightningcss keeps a declaration it can't parse verbatim, as an unparsed
+    // property, rather than raising an error, so a mistyped property name or
+    // value passes the check. An unterminated block is closed at end of input.
+    #[test]
+    fn accepts_declarations_the_parser_keeps_verbatim() -> Result<(), Box<dyn std::error::Error>> {
+        for css in [
+            "a { color: }",
+            "a { colr: red }",
+            "a { width: 10pxx }",
+            "a { color: red; ; }",
+            "a { color: red",
+        ] {
+            check_css(css, "table.css")?;
+        }
         Ok(())
     }
 
