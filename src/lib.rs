@@ -11,10 +11,18 @@ use {
         error::{Error as LightningCssError, ParserError, PrinterErrorKind},
         properties::{
             Property,
-            custom::{CustomPropertyName, Token, TokenList, TokenOrValue, UnresolvedColor},
+            custom::{
+                CustomProperty, CustomPropertyName, Token, TokenList, TokenOrValue, UnresolvedColor,
+            },
         },
-        rules::{CssRule, Location},
+        rules::{
+            CssRule, Location,
+            font_face::{FontFaceProperty, FontFaceRule},
+            font_palette_values::FontPaletteValuesProperty,
+            view_transition::ViewTransitionProperty,
+        },
         stylesheet::{ParserOptions, PrinterOptions, StyleSheet},
+        traits::ToCss,
         values::url::Url,
         visit_types,
         visitor::{Visit, VisitTypes, Visitor},
@@ -172,6 +180,124 @@ const COUNTER_STYLE_DESCRIPTORS: [&str; 10] = [
 /// Keep this sorted.
 const PAGE_DESCRIPTORS: [&str; 4] = ["bleed", "marks", "page-orientation", "size"];
 
+/// Real `@font-face` descriptors this lightningcss has no parser for.
+///
+/// It keeps a descriptor it cannot parse — an unknown name and a bad value
+/// alike — as a custom property, so [`check_css`] reports every unlisted name
+/// as a typo. A descriptor browsers support but lightningcss does not know
+/// belongs here; its value is then beyond reach, so `font-display: swapp`
+/// reads exactly like `font-display: swap`. Keep this sorted.
+pub const KNOWN_UNLISTED_FONT_FACE_DESCRIPTORS: &[&str] = &[
+    "ascent-override",
+    "descent-override",
+    "font-display",
+    "font-feature-settings",
+    "font-language-override",
+    "font-named-instance",
+    "font-variant",
+    "font-variation-settings",
+    "line-gap-override",
+    "size-adjust",
+];
+
+/// Real `@font-palette-values` descriptors this lightningcss has no parser
+/// for. It parses all three the spec defines, so this is empty until the spec
+/// grows a fourth. Keep this sorted.
+pub const KNOWN_UNLISTED_FONT_PALETTE_VALUES_DESCRIPTORS: &[&str] = &[];
+
+/// Real `@view-transition` descriptors this lightningcss has no parser for. It
+/// parses both the spec defines, so this is empty until the spec grows a
+/// third. Keep this sorted.
+pub const KNOWN_UNLISTED_VIEW_TRANSITION_DESCRIPTORS: &[&str] = &[];
+
+/// A rule whose body lightningcss parses into a typed list of its own rather
+/// than a declaration block, keeping what it cannot parse in a `Custom`
+/// variant. An unknown descriptor name and a bad value for a known one land
+/// there alike, so the name decides which of the two a report describes.
+struct DescriptorRule {
+    /// How a report names the rule.
+    at_rule: &'static str,
+    /// The descriptors lightningcss has a parser for, so an unparsed value
+    /// under one of these names is a typo.
+    parsed: &'static [&'static str],
+    /// The descriptors it has no parser for, whose values it never examines.
+    known_unlisted: &'static [&'static str],
+    /// What `known_unlisted` is called, for the report that asks for an
+    /// unknown descriptor to be added to it.
+    known_unlisted_const: &'static str,
+}
+
+const FONT_FACE_RULE: DescriptorRule = DescriptorRule {
+    at_rule: "@font-face",
+    parsed: &[
+        "font-family",
+        "font-stretch",
+        "font-style",
+        "font-weight",
+        "src",
+        "unicode-range",
+    ],
+    known_unlisted: KNOWN_UNLISTED_FONT_FACE_DESCRIPTORS,
+    known_unlisted_const: "KNOWN_UNLISTED_FONT_FACE_DESCRIPTORS",
+};
+
+const FONT_PALETTE_VALUES_RULE: DescriptorRule = DescriptorRule {
+    at_rule: "@font-palette-values",
+    parsed: &["base-palette", "font-family", "override-colors"],
+    known_unlisted: KNOWN_UNLISTED_FONT_PALETTE_VALUES_DESCRIPTORS,
+    known_unlisted_const: "KNOWN_UNLISTED_FONT_PALETTE_VALUES_DESCRIPTORS",
+};
+
+const VIEW_TRANSITION_RULE: DescriptorRule = DescriptorRule {
+    at_rule: "@view-transition",
+    parsed: &["navigation", "types"],
+    known_unlisted: KNOWN_UNLISTED_VIEW_TRANSITION_DESCRIPTORS,
+    known_unlisted_const: "KNOWN_UNLISTED_VIEW_TRANSITION_DESCRIPTORS",
+};
+
+/// A descriptor of a [`DescriptorRule`], which prints as `name: value` and
+/// holds whatever lightningcss could not parse in its `Custom` variant.
+trait Descriptor: ToCss {
+    fn custom(&self) -> Option<&CustomProperty<'_>>;
+}
+
+impl Descriptor for FontFaceProperty<'_> {
+    fn custom(&self) -> Option<&CustomProperty<'_>> {
+        match self {
+            Self::Custom(custom) => Some(custom),
+            _ => None,
+        }
+    }
+}
+
+impl Descriptor for FontPaletteValuesProperty<'_> {
+    fn custom(&self) -> Option<&CustomProperty<'_>> {
+        match self {
+            Self::Custom(custom) => Some(custom),
+            _ => None,
+        }
+    }
+}
+
+impl Descriptor for ViewTransitionProperty<'_> {
+    fn custom(&self) -> Option<&CustomProperty<'_>> {
+        match self {
+            Self::Custom(custom) => Some(custom),
+            _ => None,
+        }
+    }
+}
+
+/// The value within a descriptor's `name: value` printout, which is all the
+/// report quotes. `TokenList`'s own printer is private to lightningcss, so an
+/// unparsed value can only be read back off the whole descriptor.
+fn descriptor_value<'a>(printed: &'a str, name: &str) -> &'a str {
+    printed
+        .strip_prefix(name)
+        .and_then(|rest| rest.strip_prefix(':'))
+        .map_or(printed, str::trim_start)
+}
+
 /// The CSS-wide keywords. Every typed property parser but `all`'s rejects
 /// them, leaving a perfectly valid declaration unparsed.
 const CSS_WIDE_KEYWORDS: [&str; 5] = ["inherit", "initial", "revert", "revert-layer", "unset"];
@@ -327,6 +453,72 @@ impl DeclarationCheck<'_> {
         }
     }
 
+    /// Reports the first descriptor of `rule` that lightningcss kept unparsed
+    /// without a reason valid CSS explains. A CSS-wide keyword is no such
+    /// reason: `font-weight: inherit` is invalid in a descriptor, unlike in a
+    /// declaration.
+    fn check_descriptors<D: Descriptor>(
+        &self,
+        rule: &DescriptorRule,
+        descriptors: &[D],
+    ) -> Result<(), CssSyntaxError> {
+        for descriptor in descriptors {
+            let Some(custom) = descriptor.custom() else {
+                continue;
+            };
+            let CustomPropertyName::Unknown(name) = &custom.name else {
+                continue;
+            };
+            let name = name.as_ref();
+
+            if contains_var_or_env(&custom.value) {
+                continue;
+            }
+            if rule.parsed.contains(&name) {
+                let printed = descriptor
+                    .to_css_string(PrinterOptions::default())
+                    .unwrap_or_default();
+                let value = descriptor_value(&printed, name);
+                return Err(self.error(format!("unparseable value for `{name}`: `{value}`")));
+            }
+            if rule.known_unlisted.contains(&name) {
+                continue;
+            }
+            return Err(self.error(format!(
+                "unknown {} descriptor `{name}` (a real descriptor lightningcss \
+                 does not know? add it to {})",
+                rule.at_rule, rule.known_unlisted_const
+            )));
+        }
+        Ok(())
+    }
+
+    /// Reports a `@font-face` missing either descriptor the spec requires, the
+    /// only sign of a `src` the parser dropped, e.g. for an `!important`.
+    fn check_font_face(&self, rule: &FontFaceRule) -> Result<(), CssSyntaxError> {
+        self.check_descriptors(&FONT_FACE_RULE, &rule.properties)?;
+
+        for (name, present) in [
+            (
+                "src",
+                rule.properties
+                    .iter()
+                    .any(|property| matches!(property, FontFaceProperty::Source(_))),
+            ),
+            (
+                "font-family",
+                rule.properties
+                    .iter()
+                    .any(|property| matches!(property, FontFaceProperty::FontFamily(_))),
+            ),
+        ] {
+            if !present {
+                return Err(self.error(format!("@font-face is missing `{name}`")));
+            }
+        }
+        Ok(())
+    }
+
     /// Whether `name`, which no property parser claimed, is valid where it
     /// appears: a descriptor of the enclosing rule, or a real property
     /// lightningcss does not know.
@@ -356,6 +548,16 @@ impl<'i> Visitor<'i> for DeclarationCheck<'_> {
     fn visit_rule(&mut self, rule: &mut CssRule<'i>) -> Result<(), Self::Error> {
         if let Some(loc) = rule_location(rule) {
             self.loc = Some(loc);
+        }
+        match &*rule {
+            CssRule::FontFace(font_face) => self.check_font_face(font_face)?,
+            CssRule::FontPaletteValues(palette) => {
+                self.check_descriptors(&FONT_PALETTE_VALUES_RULE, &palette.properties)?;
+            }
+            CssRule::ViewTransition(view_transition) => {
+                self.check_descriptors(&VIEW_TRANSITION_RULE, &view_transition.properties)?;
+            }
+            _ => {}
         }
         let enclosing = std::mem::replace(&mut self.context, DeclarationContext::of(rule));
         let result = rule.visit_children(self);
@@ -401,6 +603,17 @@ impl<'i> Visitor<'i> for DeclarationCheck<'_> {
 /// name there is measured against the enclosing rule's own descriptors instead
 /// — a `@page` block holds real properties too, and a deprecated `@viewport`
 /// block is not checked at all.
+///
+/// `@font-face`, `@font-palette-values` and `@view-transition` hold their
+/// descriptors in typed lists of their own, which are checked descriptor by
+/// descriptor: an unparseable value for one lightningcss parses, and an
+/// unknown name unless [`KNOWN_UNLISTED_FONT_FACE_DESCRIPTORS`] and its two
+/// counterparts list it — the values of those it never examines. A CSS-wide
+/// keyword is invalid in a descriptor, so it is no exemption there. A
+/// `@font-face` missing `src` or `font-family` is reported as well, the only
+/// sign of a descriptor the parser dropped outright, as it does for an
+/// `!important` one and for an unknown name in the two rules whose declaration
+/// parser rejects rather than keeps it.
 pub fn check_css(css: &str, filename: &str) -> Result<(), CssSyntaxError> {
     let warnings: Warnings = Default::default();
 
@@ -930,6 +1143,227 @@ mod tests {
 
         let layered = check_css("@layer a, b;\nb { width: 10pxx }", "table.css").unwrap_err();
         assert_eq!(2, layered.line);
+        Ok(())
+    }
+
+    const UNKNOWN_FONT_FAMLY: &str = "unknown @font-face descriptor `font-famly` \
+        (a real descriptor lightningcss does not know? add it to \
+        KNOWN_UNLISTED_FONT_FACE_DESCRIPTORS)";
+
+    // `@font-face`, `@font-palette-values` and `@view-transition` each hold
+    // their descriptors in a typed list of their own, whose `Custom` variant
+    // keeps an unknown name and an unparseable value alike, so the name tells
+    // the two apart. A CSS-wide keyword is invalid in a descriptor, and so is
+    // reported rather than exempt; a `var()` reference is exempt as
+    // everywhere else. What lightningcss drops outright cannot be reported:
+    // a descriptor made `!important`, a typo'd name in the two rules whose
+    // parser rejects the declaration instead of keeping it, and a bad value
+    // for a descriptor it has no parser for (`font-display: swapp`). A
+    // `@font-face` missing either descriptor the spec requires is reported,
+    // which is the only sign of an `!important` `src` — and of a `var()` one,
+    // which browsers do not substitute either.
+    #[test]
+    fn reports_descriptor_typos() -> Result<(), Box<dyn std::error::Error>> {
+        for (css, expected) in [
+            (
+                "@font-face { font-famly: x; src: url(x.woff2) }",
+                Some(UNKNOWN_FONT_FAMLY.to_string()),
+            ),
+            (
+                "@font-face { font-family: X; src: url(a.woff2); font-weight: bolder-ish }",
+                Some("unparseable value for `font-weight`: `bolder-ish`".to_string()),
+            ),
+            (
+                "@font-face { font-family: X; src: url(a.woff2); font-weight: inherit }",
+                Some("unparseable value for `font-weight`: `inherit`".to_string()),
+            ),
+            (
+                "@font-face { font-family: X; src: url(a.woff2); font-weight: }",
+                Some("unparseable value for `font-weight`: ``".to_string()),
+            ),
+            (
+                "@font-face { font-family: X; src: url(a.woff2); font-weight: var(--w) }",
+                None,
+            ),
+            (
+                "@font-face { font-family: X; src: url(a.woff2); --custom: x }",
+                None,
+            ),
+            (
+                "@font-face { font-family: X; src: url(a.woff2); font-style: italic; \
+                 font-stretch: 50% 200%; unicode-range: U+0-7F }",
+                None,
+            ),
+            (
+                "@font-face { font-family: X; src: url(a.woff2); font-display: swapp }",
+                None,
+            ),
+            (
+                "@font-face { font-family: X; src: url(a.woff2); font-display: swap !important }",
+                None,
+            ),
+            ("@font-face { font-family: X; src: url( }", None),
+            (
+                "@font-face { }",
+                Some("@font-face is missing `src`".to_string()),
+            ),
+            (
+                "@font-face { font-family: X }",
+                Some("@font-face is missing `src`".to_string()),
+            ),
+            (
+                "@font-face { font-family: X; src: var(--s) }",
+                Some("@font-face is missing `src`".to_string()),
+            ),
+            (
+                "@font-face { src: url(a.woff2) }",
+                Some("@font-face is missing `font-family`".to_string()),
+            ),
+            (
+                "@font-palette-values --p { base-palette: 1; font-family: X; \
+                 override-colors: 0 red }",
+                None,
+            ),
+            (
+                "@font-palette-values --p { base-palette: dork }",
+                Some("unparseable value for `base-palette`: `dork`".to_string()),
+            ),
+            ("@font-palette-values --p { base-palett: 1 }", None),
+            ("@view-transition { navigation: auto; types: slide }", None),
+            (
+                "@view-transition { navigation: autoo }",
+                Some("unparseable value for `navigation`: `autoo`".to_string()),
+            ),
+            ("@view-transition { navigaton: auto }", None),
+        ] {
+            match (check_css(css, "table.css"), expected) {
+                (Ok(()), None) => {}
+                (Err(error), Some(message)) if error.message == message => {}
+                (got, expected) => {
+                    return Err(format!("{css}: expected {expected:?}, got {got:?}").into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // A descriptor is reported at its own rule, which the visitor reaches
+    // however deeply the rule is nested.
+    #[test]
+    fn descriptor_typos_report_their_rule() -> Result<(), Box<dyn std::error::Error>> {
+        let nested = check_css(
+            "a { color: red }\n@media print {\n  @font-face { font-famly: x }\n}\n",
+            "table.css",
+        )
+        .unwrap_err();
+        assert_eq!(3, nested.line);
+        assert_eq!(3, nested.column);
+        assert_eq!(UNKNOWN_FONT_FAMLY, nested.message);
+
+        let layered = check_css(
+            "@layer base { @supports (display: grid) { @font-face { font-famly: x } } }",
+            "table.css",
+        )
+        .unwrap_err();
+        assert_eq!(1, layered.line);
+        assert_eq!(43, layered.column);
+        Ok(())
+    }
+
+    // Every descriptor lightningcss parses must be checked, and every
+    // descriptor it does not must be waved through: a lightningcss upgrade
+    // that starts parsing an allowlisted descriptor would otherwise leave the
+    // check reporting valid CSS, or accepting a typo, without a word.
+    #[test]
+    fn checks_the_descriptors_it_lists() -> Result<(), Box<dyn std::error::Error>> {
+        // A rule, how a snippet of it opens, a value none of its parsers
+        // accept for each descriptor it parses, and a plausible value for
+        // each descriptor it does not.
+        struct Case {
+            rule: &'static DescriptorRule,
+            opening: &'static str,
+            unparseable: &'static [(&'static str, &'static str)],
+            plausible: &'static [(&'static str, &'static str)],
+        }
+
+        let cases = [
+            Case {
+                rule: &FONT_FACE_RULE,
+                opening: "@font-face { font-family: X; src: url(a.woff2); ",
+                unparseable: &[
+                    ("font-family", "1px"),
+                    ("font-stretch", "wideish"),
+                    ("font-style", "obliqueish"),
+                    ("font-weight", "bolder-ish"),
+                    ("src", "nowhere"),
+                    ("unicode-range", "bogus"),
+                ],
+                plausible: &[
+                    ("ascent-override", "90%"),
+                    ("descent-override", "10%"),
+                    ("font-display", "swap"),
+                    ("font-feature-settings", "\"liga\" 1"),
+                    ("font-language-override", "\"ENG\""),
+                    ("font-named-instance", "\"Bold\""),
+                    ("font-variant", "small-caps"),
+                    ("font-variation-settings", "\"wght\" 700"),
+                    ("line-gap-override", "0%"),
+                    ("size-adjust", "100%"),
+                ],
+            },
+            Case {
+                rule: &FONT_PALETTE_VALUES_RULE,
+                opening: "@font-palette-values --p { ",
+                unparseable: &[
+                    ("base-palette", "dork"),
+                    ("font-family", "1px"),
+                    ("override-colors", "bogus"),
+                ],
+                plausible: &[],
+            },
+            Case {
+                rule: &VIEW_TRANSITION_RULE,
+                opening: "@view-transition { ",
+                unparseable: &[("navigation", "autoo"), ("types", "a none")],
+                plausible: &[],
+            },
+        ];
+
+        for Case {
+            rule,
+            opening,
+            unparseable,
+            plausible,
+        } in cases
+        {
+            let value = |values: &[(&str, &str)], name: &str| {
+                values
+                    .iter()
+                    .find_map(|(descriptor, value)| {
+                        (*descriptor == name).then(|| value.to_string())
+                    })
+                    .ok_or(format!("{} `{name}` has no value to check", rule.at_rule))
+            };
+
+            for name in rule.parsed {
+                let css = format!("{opening}{name}: {} }}", value(unparseable, name)?);
+                let error = check_css(&css, "table.css")
+                    .err()
+                    .ok_or(format!("{css}: expected an unparseable value"))?;
+                assert_eq!(
+                    format!(
+                        "unparseable value for `{name}`: `{}`",
+                        value(unparseable, name)?
+                    ),
+                    error.message
+                );
+            }
+
+            for name in rule.known_unlisted {
+                let css = format!("{opening}{name}: {} }}", value(plausible, name)?);
+                check_css(&css, "table.css")?;
+            }
+        }
         Ok(())
     }
 
