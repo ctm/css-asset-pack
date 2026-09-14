@@ -20,7 +20,7 @@ regex = "1.12"
 [dependencies]
 # Can't use zstd with wasm32-unknown-unknown
 zip = { version = "8.4", default-features = false, features = ["bzip2", "deflate", "deflate64", "lzma", "ppmd", "xz"] }
-lightningcss = { version = "1.0.0-alpha.71", default-features = false, features = ["visitor"] }
+lightningcss = { version = "1.0.0-alpha.72", default-features = false, features = ["visitor"] }
 thiserror = "2.0"
 sasso = { version = "0.9.1", optional = true }
 mime_guess = { version = "2.0", default-features = false, optional = true }
@@ -31,7 +31,7 @@ web-sys = { version = "0.3.83", default-features = false, features = ["Blob", "B
 js-sys = "0.3"
 
 # NOTE: if we use the "0.4" here, our tests will fail to compile, because
-#       lightningcss v1.0.0-alpha.71 brings in ahash  v0.8.12 brings in
+#       lightningcss v1.0.0-alpha.72 brings in ahash  v0.8.12 brings in
 #       getrandome 0.3 and we won't then have the wasm_js feature. The
 #       wasm_js backend is only meaningful (and only needed) on wasm, so the
 #       direct dependency is scoped to that target.
