@@ -7,8 +7,13 @@ use {
 };
 use {
     lightningcss::{
+        declaration::DeclarationBlock,
         error::{Error as LightningCssError, ParserError, PrinterErrorKind},
-        rules::CssRule,
+        properties::{
+            Property,
+            custom::{CustomPropertyName, Token, TokenList, TokenOrValue, UnresolvedColor},
+        },
+        rules::{CssRule, Location},
         stylesheet::{ParserOptions, PrinterOptions, StyleSheet},
         values::url::Url,
         visit_types,
@@ -124,24 +129,219 @@ fn syntax_error(error: LightningCssError<ParserError>, filename: &str) -> CssSyn
     }
 }
 
+/// Real CSS properties this lightningcss has no parser for.
+///
+/// It keeps a declaration whose name it does not know as a custom property, so
+/// [`check_css`] reports every unlisted one as a typo. A property browsers
+/// support but lightningcss does not know belongs here — the one-line fix when
+/// a newly adopted property is reported. A vendor prefix earns no exemption of
+/// its own, since a typo can be prefixed too, so `-ms-overflow-style` is
+/// listed like any other name. Keep this sorted.
+pub const KNOWN_UNLISTED_PROPERTIES: &[&str] = &[
+    "-ms-overflow-style",
+    "border-collapse",
+    "content",
+    "float",
+    "font-variant-numeric",
+    "overflow-anchor",
+    "pointer-events",
+    "scrollbar-width",
+    "will-change",
+];
+
+/// The CSS-wide keywords. Every typed property parser but `all`'s rejects
+/// them, leaving a perfectly valid declaration unparsed.
+const CSS_WIDE_KEYWORDS: [&str; 5] = ["inherit", "initial", "revert", "revert-layer", "unset"];
+
+/// Whether `tokens` reference a `var()` or an `env()` anywhere within, which
+/// lightningcss cannot parse however well formed the value is. A reference
+/// nested in a function's arguments or in an `rgb()`/`hsl()` alpha or a
+/// `light-dark()` component counts; a `var()`/`env()` fallback needs no walk of
+/// its own, being inside a token that already matches.
+fn contains_var_or_env(tokens: &TokenList) -> bool {
+    tokens.0.iter().any(|token| match token {
+        TokenOrValue::Var(_) | TokenOrValue::Env(_) => true,
+        TokenOrValue::Function(function) => contains_var_or_env(&function.arguments),
+        TokenOrValue::UnresolvedColor(color) => match color {
+            UnresolvedColor::RGB { alpha, .. } | UnresolvedColor::HSL { alpha, .. } => {
+                contains_var_or_env(alpha)
+            }
+            UnresolvedColor::LightDark { light, dark } => {
+                contains_var_or_env(light) || contains_var_or_env(dark)
+            }
+        },
+        _ => false,
+    })
+}
+
+/// The one identifier `tokens` amount to, ignoring surrounding whitespace.
+fn lone_ident<'a>(tokens: &'a TokenList) -> Option<&'a str> {
+    let mut idents = tokens.0.iter().filter(|token| !token.is_whitespace());
+
+    match (idents.next(), idents.next()) {
+        (Some(TokenOrValue::Token(Token::Ident(ident))), None) => Some(ident.as_ref()),
+        _ => None,
+    }
+}
+
+/// Whether `tokens` are a lone CSS-wide keyword, valid on every property.
+fn is_css_wide_keyword(tokens: &TokenList) -> bool {
+    lone_ident(tokens).is_some_and(|ident| {
+        CSS_WIDE_KEYWORDS
+            .iter()
+            .any(|keyword| ident.eq_ignore_ascii_case(keyword))
+    })
+}
+
+/// Whether `tokens` are the `none` that the shadow properties' list parsers
+/// leave unparsed although it is valid on both.
+fn is_shadow_none(name: &str, tokens: &TokenList) -> bool {
+    matches!(name, "text-shadow" | "box-shadow")
+        && lone_ident(tokens).is_some_and(|ident| ident.eq_ignore_ascii_case("none"))
+}
+
+/// Where `rule` starts, for the rule kinds that carry a location. The kinds
+/// that do not are reported at the last location seen, which for a nested rule
+/// is the rule enclosing it.
+fn rule_location(rule: &CssRule) -> Option<Location> {
+    match rule {
+        CssRule::Media(rule) => Some(rule.loc),
+        CssRule::Import(rule) => Some(rule.loc),
+        CssRule::Style(rule) => Some(rule.loc),
+        CssRule::Keyframes(rule) => Some(rule.loc),
+        CssRule::FontFace(rule) => Some(rule.loc),
+        CssRule::FontPaletteValues(rule) => Some(rule.loc),
+        CssRule::FontFeatureValues(rule) => Some(rule.loc),
+        CssRule::Page(rule) => Some(rule.loc),
+        CssRule::Supports(rule) => Some(rule.loc),
+        CssRule::CounterStyle(rule) => Some(rule.loc),
+        CssRule::Namespace(rule) => Some(rule.loc),
+        CssRule::MozDocument(rule) => Some(rule.loc),
+        CssRule::Nesting(rule) => Some(rule.loc),
+        CssRule::NestedDeclarations(rule) => Some(rule.loc),
+        CssRule::Viewport(rule) => Some(rule.loc),
+        CssRule::CustomMedia(rule) => Some(rule.loc),
+        CssRule::LayerBlock(rule) => Some(rule.loc),
+        CssRule::Property(rule) => Some(rule.loc),
+        CssRule::Container(rule) => Some(rule.loc),
+        CssRule::Scope(rule) => Some(rule.loc),
+        CssRule::StartingStyle(rule) => Some(rule.loc),
+        CssRule::ViewTransition(rule) => Some(rule.loc),
+        CssRule::Unknown(rule) => Some(rule.loc),
+        _ => None,
+    }
+}
+
+/// Fails on the first declaration [`check_css`] considers a typo. A
+/// declaration carries no location of its own, so rules are visited to track
+/// the enclosing one's.
+struct DeclarationCheck<'a> {
+    filename: &'a str,
+    loc: Option<Location>,
+}
+
+impl DeclarationCheck<'_> {
+    fn error(&self, message: String) -> CssSyntaxError {
+        let (line, column) = self.loc.map_or((0, 0), |loc| (loc.line + 1, loc.column));
+
+        CssSyntaxError {
+            filename: self.filename.to_string(),
+            line,
+            column,
+            message,
+        }
+    }
+
+    fn check(&self, property: &Property) -> Result<(), CssSyntaxError> {
+        match property {
+            Property::Unparsed(unparsed) => {
+                let name = unparsed.property_id.name();
+                if contains_var_or_env(&unparsed.value)
+                    || is_css_wide_keyword(&unparsed.value)
+                    || is_shadow_none(name, &unparsed.value)
+                {
+                    return Ok(());
+                }
+                let value = property
+                    .value_to_css_string(PrinterOptions::default())
+                    .unwrap_or_default();
+                Err(self.error(format!("unparseable value for `{name}`: `{value}`")))
+            }
+            Property::Custom(custom) => {
+                let CustomPropertyName::Unknown(ident) = &custom.name else {
+                    return Ok(());
+                };
+                let name: &str = ident.as_ref();
+                if KNOWN_UNLISTED_PROPERTIES.contains(&name) {
+                    return Ok(());
+                }
+                Err(self.error(format!(
+                    "unknown property `{name}` (a real property lightningcss \
+                     does not know? add it to KNOWN_UNLISTED_PROPERTIES)"
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+impl<'i> Visitor<'i> for DeclarationCheck<'_> {
+    type Error = CssSyntaxError;
+
+    fn visit_types(&self) -> VisitTypes {
+        visit_types!(RULES | PROPERTIES)
+    }
+
+    fn visit_rule(&mut self, rule: &mut CssRule<'i>) -> Result<(), Self::Error> {
+        if let Some(loc) = rule_location(rule) {
+            self.loc = Some(loc);
+        }
+        rule.visit_children(self)
+    }
+
+    fn visit_declaration_block(
+        &mut self,
+        block: &mut DeclarationBlock<'i>,
+    ) -> Result<(), Self::Error> {
+        for property in block
+            .declarations
+            .iter()
+            .chain(block.important_declarations.iter())
+        {
+            self.check(property)?;
+        }
+        Ok(())
+    }
+}
+
 /// Reports the first syntax error in `css`, if any, using the parser asset
 /// packs are built with. `filename` only names the CSS in the returned error.
 ///
-/// Unlike a pack build, the check also reports the errors the parser recovers
-/// from rather than fails on, e.g. an unknown at-rule. It cannot report a
-/// mistyped property name or value (`a { colr: red }`, `a { width: 10pxx }`,
-/// `a { color: }`): lightningcss keeps a declaration it can't parse verbatim,
-/// as an unparsed property, so no error is raised for it to collect.
+/// Unlike a pack build, the check also reports what the parser keeps rather
+/// than fails on: the errors it recovers from, e.g. an unknown at-rule, and
+/// the declarations it stores verbatim instead of rejecting — a value the
+/// property's own parser cannot parse (`width: 10pxx`, `color: redd`,
+/// `color: ;`) and an unknown property name (`colr: red`). A declaration
+/// carries no location, so it is reported at its enclosing rule's.
+///
+/// Values referencing `var()`/`env()`, a lone CSS-wide keyword, and `none` on
+/// `text-shadow`/`box-shadow` are valid CSS lightningcss nonetheless leaves
+/// unparsed, so they are exempt; the real properties it does not know are
+/// listed in [`KNOWN_UNLISTED_PROPERTIES`].
 pub fn check_css(css: &str, filename: &str) -> Result<(), CssSyntaxError> {
     let warnings: Warnings = Default::default();
 
-    parse_stylesheet(css, filename, Some(warnings.clone()))
+    let mut parsed_css = parse_stylesheet(css, filename, Some(warnings.clone()))
         .map_err(|e| syntax_error(e, filename))?;
 
-    match warnings.read().ok().and_then(|w| w.first().cloned()) {
-        Some(warning) => Err(syntax_error(warning, filename)),
-        None => Ok(()),
+    if let Some(warning) = warnings.read().ok().and_then(|w| w.first().cloned()) {
+        return Err(syntax_error(warning, filename));
     }
+
+    parsed_css.visit(&mut DeclarationCheck {
+        filename,
+        loc: None,
+    })
 }
 
 #[derive(Clone)]
@@ -497,19 +697,154 @@ mod tests {
         assert!(!error.message.is_empty());
     }
 
-    // lightningcss keeps a declaration it can't parse verbatim, as an unparsed
-    // property, rather than raising an error, so a mistyped property name or
-    // value passes the check. An unterminated block is closed at end of input.
+    const UNKNOWN_COLR: &str = "unknown property `colr` (a real property \
+        lightningcss does not know? add it to KNOWN_UNLISTED_PROPERTIES)";
+
+    // What the declaration check does and does not report, declaration by
+    // declaration: `None` expects the CSS to pass, `Some` the exact message.
+    // A value lightningcss cannot parse is a typo unless a `var()`/`env()`
+    // reference, a CSS-wide keyword, or a shadow `none` explains it, and an
+    // unknown property name is a typo unless KNOWN_UNLISTED_PROPERTIES lists
+    // it — `text-wrap` is real CSS this lightningcss lacks, and is reported
+    // until someone adds it there. An unterminated block is closed at end of
+    // input, and a stray `;` is no declaration at all.
     #[test]
-    fn accepts_declarations_the_parser_keeps_verbatim() -> Result<(), Box<dyn std::error::Error>> {
-        for css in [
-            "a { color: }",
-            "a { colr: red }",
-            "a { width: 10pxx }",
-            "a { color: red; ; }",
-            "a { color: red",
+    fn reports_declaration_typos() -> Result<(), Box<dyn std::error::Error>> {
+        for (css, expected) in [
+            ("a { colr: red }", Some(UNKNOWN_COLR.to_string())),
+            (
+                "a { text-wrap: balance }",
+                Some(UNKNOWN_COLR.replace("colr", "text-wrap")),
+            ),
+            (
+                "a { width: 10pxx }",
+                Some("unparseable value for `width`: `10pxx`".to_string()),
+            ),
+            (
+                "a { color: redd }",
+                Some("unparseable value for `color`: `redd`".to_string()),
+            ),
+            (
+                "a { color: }",
+                Some("unparseable value for `color`: ` `".to_string()),
+            ),
+            (
+                "a { margin: 1px 2px 3px 4px 5px }",
+                Some("unparseable value for `margin`: `1px 2px 3px 4px 5px`".to_string()),
+            ),
+            (
+                "a { transition: color .2s eas }",
+                Some("unparseable value for `transition`: `color .2s eas`".to_string()),
+            ),
+            (
+                "a { display: flexx }",
+                Some("unparseable value for `display`: `flexx`".to_string()),
+            ),
+            ("a { --x: 1px; width: var(--x) }", None),
+            ("a { width: calc(100% - var(--x)) }", None),
+            ("a { padding-top: env(safe-area-inset-top) }", None),
+            ("a { color: rgb(0 0 0 / var(--alpha)) }", None),
+            ("a { container-type: inline-size }", None),
+            ("a { color: red; ; }", None),
+            ("a { background: url( }", None),
+            ("a { color: red", None),
+            ("a { text-shadow: none }", None),
+            ("a { box-shadow: none }", None),
+            ("a { transition: none }", None),
+            ("a { color: inherit !important }", None),
         ] {
-            check_css(css, "table.css")?;
+            match (check_css(css, "table.css"), expected) {
+                (Ok(()), None) => {}
+                (Err(error), Some(message)) if error.message == message => {}
+                (got, expected) => {
+                    return Err(format!("{css}: expected {expected:?}, got {got:?}").into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // `!important` declarations are kept in their own list, which the check
+    // must visit too.
+    #[test]
+    fn reports_typos_in_important_declarations() -> Result<(), Box<dyn std::error::Error>> {
+        let error = check_css("a { color: red; colr: red !important }", "table.css").unwrap_err();
+
+        assert_eq!(UNKNOWN_COLR, error.message);
+        Ok(())
+    }
+
+    // A declaration carries no location, so it is reported at its enclosing
+    // rule's — the innermost one, not the at-rule wrapping it.
+    #[test]
+    fn declaration_typos_report_the_enclosing_rule() -> Result<(), Box<dyn std::error::Error>> {
+        let error = check_css("a { color: red }\n\nb { width: 10pxx }\n", "table.css").unwrap_err();
+        assert_eq!(3, error.line);
+        assert_eq!(1, error.column);
+
+        let nested = check_css(
+            "@media (min-width: 1px) {\n  a { width: 10pxx }\n}\n",
+            "table.css",
+        )
+        .unwrap_err();
+        assert_eq!(2, nested.line);
+        assert_eq!("table.css", nested.filename);
+        Ok(())
+    }
+
+    #[test]
+    fn exemptions_recognize_their_token_shapes() -> Result<(), Box<dyn std::error::Error>> {
+        use lightningcss::traits::ParseWithOptions;
+
+        fn tokens(value: &'static str) -> Result<TokenList<'static>, String> {
+            TokenList::parse_string_with_options(value, ParserOptions::default())
+                .map_err(|e| format!("can't parse {value}: {e:?}"))
+        }
+
+        assert!(contains_var_or_env(&tokens("var(--x)")?));
+        assert!(contains_var_or_env(&tokens("env(safe-area-inset-top)")?));
+        assert!(contains_var_or_env(&tokens("foo(1px, var(--x))")?));
+        assert!(contains_var_or_env(&tokens("var(--x, var(--y))")?));
+        assert!(contains_var_or_env(&tokens("rgb(0 0 0 / var(--alpha))")?));
+        assert!(contains_var_or_env(&tokens("light-dark(var(--l), black)")?));
+        assert!(!contains_var_or_env(&tokens("1px solid red")?));
+
+        assert!(is_css_wide_keyword(&tokens("inherit")?));
+        assert!(is_css_wide_keyword(&tokens(" revert-layer ")?));
+        assert!(is_css_wide_keyword(&tokens("INITIAL")?));
+        assert!(!is_css_wide_keyword(&tokens("inherit red")?));
+        assert!(!is_css_wide_keyword(&tokens("inherited")?));
+
+        assert!(is_shadow_none("box-shadow", &tokens("none")?));
+        assert!(is_shadow_none("text-shadow", &tokens("none")?));
+        assert!(!is_shadow_none("color", &tokens("none")?));
+        assert!(!is_shadow_none("box-shadow", &tokens("none none")?));
+        Ok(())
+    }
+
+    // The gate for the declaration check: every stylesheet this tree ships
+    // must pass it, or `render` and `live` reject CSS that is perfectly good.
+    #[cfg(all(feature = "sasso", not(target_arch = "wasm32")))]
+    #[test]
+    fn accepts_the_stylesheets_of_the_tree_it_is_vendored_in()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let web = concat!(env!("CARGO_MANIFEST_DIR"), "/../front-ends/web");
+
+        for name in ["mb2.scss", "table.scss"] {
+            let path = format!("{web}/{name}");
+            let source = std::fs::read_to_string(&path)?;
+            let importer = sasso::FsImporter::new(Vec::new());
+            let options = sasso::Options::default()
+                .with_syntax(sasso::Syntax::Scss)
+                .with_importer(&importer)
+                .with_url(&path);
+            let compiled = sasso::compile(&source, &options)
+                .map_err(|e| format!("can't compile {path}: {e:?}"))?;
+            check_css(&compiled, &format!("{name} (compiled)"))?;
+        }
+
+        for name in ["static/mb2-static.css", "static/spinner.css"] {
+            check_css(&std::fs::read_to_string(format!("{web}/{name}"))?, name)?;
         }
         Ok(())
     }
