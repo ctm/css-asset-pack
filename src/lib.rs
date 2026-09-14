@@ -7,9 +7,9 @@ use {
 };
 use {
     lightningcss::{
-        error::{Error as LightningCssError, PrinterErrorKind},
+        error::{Error as LightningCssError, ParserError, PrinterErrorKind},
         rules::CssRule,
-        stylesheet::{PrinterOptions, StyleSheet},
+        stylesheet::{ParserOptions, PrinterOptions, StyleSheet},
         values::url::Url,
         visit_types,
         visitor::{Visit, VisitTypes, Visitor},
@@ -70,6 +70,61 @@ pub enum Error {
     #[cfg(feature = "sasso")]
     #[error("can't parse sass: #{0:?}")]
     CantParseSass(sasso::Error),
+}
+
+/// A CSS syntax error, located within the CSS that was checked.
+///
+/// `line` and `column` are both 1-based, and are 0 when the underlying error
+/// carries no location. lightningcss numbers lines from 0 and columns from 1,
+/// so the line it reports is incremented here.
+#[derive(ThisError, Debug, Clone, PartialEq, Eq)]
+#[error("{filename}:{line}:{column}: {message}")]
+pub struct CssSyntaxError {
+    pub filename: String,
+    pub line: u32,
+    pub column: u32,
+    pub message: String,
+}
+
+fn parse_stylesheet<'i>(
+    css: &'i str,
+    filename: &str,
+) -> Result<StyleSheet<'i>, LightningCssError<ParserError<'i>>> {
+    StyleSheet::parse(
+        css,
+        ParserOptions {
+            filename: filename.to_string(),
+            ..Default::default()
+        },
+    )
+}
+
+/// Reports the first syntax error in `css`, if any, using the parser and the
+/// parser options that asset packs are built with. `filename` only names the
+/// CSS in the returned error.
+///
+/// The parser recovers from a declaration it can't parse by dropping it, so it
+/// reports only an error that stops the parse, e.g. a bad selector or at-rule
+/// prelude.
+pub fn check_css(css: &str, filename: &str) -> Result<(), CssSyntaxError> {
+    parse_stylesheet(css, filename).map(|_| ()).map_err(|e| {
+        let message = e.kind.to_string();
+
+        match e.loc {
+            Some(loc) => CssSyntaxError {
+                filename: loc.filename,
+                line: loc.line + 1,
+                column: loc.column,
+                message,
+            },
+            None => CssSyntaxError {
+                filename: filename.to_string(),
+                line: 0,
+                column: 0,
+                message,
+            },
+        }
+    })
 }
 
 #[derive(Clone)]
@@ -165,8 +220,8 @@ impl<R: Read + Seek> Builder<R> {
                 }
                 css_source
             };
-            let mut parsed_css = StyleSheet::parse(&css_source, Default::default())
-                .map_err(|e| CantParse(e.to_string()))?;
+            let mut parsed_css =
+                parse_stylesheet(&css_source, filename).map_err(|e| CantParse(e.to_string()))?;
 
             let incoming_visit_pass = self.visit_pass;
 
@@ -373,6 +428,53 @@ mod tests {
             data.contains("body a"),
             "expected SASS nesting flattened to a descendant selector, got: {data}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_valid_css() -> Result<(), Box<dyn std::error::Error>> {
+        check_css(
+            "@import \"other.css\";\nbody a { color: #123456; background: url(bg.png); }\n",
+            "style.css",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn reports_located_syntax_errors() {
+        for css in [
+            "@media (min-width: ) {}",
+            "a:: { color: red }",
+            "@import url(x.css) foo bar;",
+            "a[ { color: red }",
+        ] {
+            let error = check_css(css, "table.css").unwrap_err();
+
+            assert_eq!("table.css", error.filename, "for {css}");
+            assert!(error.line >= 1, "expected a 1-based line, got {error:?}");
+            assert!(
+                error.column >= 1,
+                "expected a 1-based column, got {error:?}"
+            );
+            assert!(!error.message.is_empty(), "for {css}");
+        }
+    }
+
+    #[test]
+    fn reports_one_based_lines() {
+        let error =
+            check_css("a { color: red }\n\n@media (min-width: ) {}\n", "table.css").unwrap_err();
+
+        assert_eq!(3, error.line);
+        assert_eq!(18, error.column);
+    }
+
+    // The parser recovers from an unparsable declaration (it drops it) and
+    // closes an unterminated block at end of input, so neither is reported.
+    #[test]
+    fn accepts_what_the_parser_recovers_from() -> Result<(), Box<dyn std::error::Error>> {
+        check_css("a { color: }", "table.css")?;
+        check_css("a { color: red", "table.css")?;
         Ok(())
     }
 
