@@ -713,9 +713,9 @@ dependencies = [
 
 [[package]]
 name = "sasso"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6ae98548b2e9447aca2340b1c082c82d06721586708b808c52e2f908499c2f8"
+checksum = "cfe4cb7cb514981154e05fdb900ca0db153b413dc5a62a671fff34022c40f8a8"
 
 [[package]]
 name = "serde"
