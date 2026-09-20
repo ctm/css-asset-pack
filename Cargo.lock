@@ -149,7 +149,7 @@ dependencies = [
 
 [[package]]
 name = "css-asset-pack"
-version = "0.1.8"
+version = "0.1.10"
 dependencies = [
  "base64",
  "getrandom",
@@ -713,9 +713,9 @@ dependencies = [
 
 [[package]]
 name = "sasso"
-version = "0.15.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfe4cb7cb514981154e05fdb900ca0db153b413dc5a62a671fff34022c40f8a8"
+checksum = "d3d06deed395899cb48211be074452ddfb68107e253d4ab95855e39c16b530b7"
 
 [[package]]
 name = "serde"
