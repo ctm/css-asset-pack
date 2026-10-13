@@ -1,6 +1,6 @@
 [package]
 name = "css-asset-pack"
-version = "0.1.12"
+version = "0.1.13"
 description = """
 Allows a zip file containing a top-level CSS file and assets (e.g.,
 image files, fonts) to be transformed into Object URLs that can then
@@ -19,7 +19,7 @@ regex = "1.12"
 
 [dependencies]
 # Can't use zstd with wasm32-unknown-unknown
-zip = { version = "8.4", default-features = false, features = ["bzip2", "deflate", "deflate64", "lzma", "ppmd", "xz"] }
+zip = { version = "9.0", default-features = false, features = ["bzip2", "deflate", "deflate64", "lzma", "ppmd", "xz"] }
 lightningcss = { version = "1.0.0-alpha.72", default-features = false, features = ["visitor"] }
 thiserror = "2.0"
 sasso = { version = "0.21.0", optional = true }
